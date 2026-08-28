@@ -17,14 +17,18 @@ import (
 	"time"
 )
 
-const version = "2.2.0"
+const version = "2.3.0"
 
 var (
-	listenPort   = "8787"
-	startTime    = time.Now()
-	requestCount = 0
-	requestLogs  = make([]LogEntry, 0, 100)
-	logMutex     sync.Mutex
+	listenPort      = "8787"
+	startTime       = time.Now()
+	requestCount    = 0
+	requestLogs     = make([]LogEntry, 0, 100)
+	logMutex        sync.Mutex
+	// OAuth 配置（从环境变量读取）
+	oauthClientID     = os.Getenv("GITHUB_CLIENT_ID")
+	oauthClientSecret = os.Getenv("GITHUB_CLIENT_SECRET")
+	oauthRedirectURI  = os.Getenv("GITHUB_REDIRECT_URI")
 )
 
 type LogEntry struct {
@@ -62,6 +66,10 @@ func main() {
 	mux.HandleFunc("/api/fs/mkdir", handleFSMkdir)
 	mux.HandleFunc("/api/fs/stat", handleFSStat)
 	mux.HandleFunc("/api/exec", handleExec)
+	// GitHub OAuth
+	mux.HandleFunc("/api/oauth/url", handleOAuthURL)
+	mux.HandleFunc("/api/oauth/login", handleOAuthLogin)
+	mux.HandleFunc("/api/oauth/callback", handleOAuthCallback)
 
 	// 日志中间件
 	loggedMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -858,4 +866,141 @@ func extractBV(s string) string {
 
 func isAlnum(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+}
+
+// ==================== GitHub OAuth ====================
+
+func handleOAuthURL(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	
+	if oauthClientID == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": false,
+			"error":   "OAuth not configured. Please set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_REDIRECT_URI environment variables.",
+		})
+		return
+	}
+	
+	redirectURI := oauthRedirectURI
+	if redirectURI == "" {
+		redirectURI = fmt.Sprintf("http://localhost:%s/api/oauth/callback", listenPort)
+	}
+	
+	authURL := fmt.Sprintf(
+		"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=repo,workflow&state=gd-%d",
+		oauthClientID,
+		url.QueryEscape(redirectURI),
+		time.Now().Unix(),
+	)
+	
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":  true,
+		"auth_url": authURL,
+	})
+}
+
+func handleOAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if oauthClientID == "" {
+		http.Error(w, "OAuth not configured", http.StatusServiceUnavailable)
+		return
+	}
+	
+	redirectURI := oauthRedirectURI
+	if redirectURI == "" {
+		redirectURI = fmt.Sprintf("http://localhost:%s/api/oauth/callback", listenPort)
+	}
+	
+	authURL := fmt.Sprintf(
+		"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=repo,workflow&state=gd-%d",
+		oauthClientID,
+		url.QueryEscape(redirectURI),
+		time.Now().Unix(),
+	)
+	
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+func handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "Missing code parameter", http.StatusBadRequest)
+		return
+	}
+	
+	// 用 code 换 access token
+	tokenURL := "https://github.com/login/oauth/access_token"
+	data := url.Values{
+		"client_id":     {oauthClientID},
+		"client_secret": {oauthClientSecret},
+		"code":          {code},
+	}
+	
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Failed to exchange code for token", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+	
+	var result struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		Scope       string `json:"scope"`
+		Error       string `json:"error"`
+		ErrorDesc   string `json:"error_description"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	
+	if result.Error != "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<html><body><script>
+			window.opener.postMessage({type:'gd-oauth',error:'%s'},'*');
+			window.close();
+		</script><p>OAuth failed: %s</p></body></html>`, result.ErrorDesc, result.ErrorDesc)
+		return
+	}
+	
+	// 返回 HTML 页面，通过 postMessage 把 token 传给前端窗口
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>GitHub Drive - Login Success</title>
+<style>
+body{font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0}
+.card{background:#fff;border-radius:16px;padding:40px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.icon{font-size:48px;margin-bottom:16px}
+h1{color:#111827;margin:0 0 8px}
+p{color:#6b7280;margin:0}
+</style></head>
+<body>
+<div class="card">
+<div class="icon">✅</div>
+<h1>Login Successful!</h1>
+<p>You can close this window now.</p>
+</div>
+<script>
+(function(){
+	var token = '%s';
+	var msg = {type:'gd-oauth',token:token};
+	// 发送给 opener（主窗口）
+	if(window.opener){
+		window.opener.postMessage(msg,'*');
+	}
+	// 也广播给所有窗口
+	window.postMessage(msg,'*');
+	// 1秒后自动关闭
+	setTimeout(function(){window.close();},1500);
+})();
+</script>
+</body></html>`, result.AccessToken)
 }
